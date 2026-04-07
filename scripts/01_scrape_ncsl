@@ -1,2 +1,126 @@
-import requests
+import pandas as pd
 from bs4 import BeautifulSoup
+import re
+
+def load_page(filepath):
+    """Load saved HTML file, download it after searching as HTML only"""
+    with open(filepath, "r", encoding="utf-8") as f:
+        return BeautifulSoup(f.read(), "html.parser")
+
+def parse_bill_identifier(identifier):
+    """Split bill identifier into state, bill_number, and bill_id"""
+    identifier = identifier.strip()
+    state = identifier[:2]
+    bill_number = identifier[2:].strip()
+    bill_number = re.sub(r'\s+', ' ', bill_number).strip()
+    bill_id = state + bill_number.replace(" ", "")
+    return state, bill_number, bill_id
+
+def extract_party(author):
+    """Extract party from primary author e.g. 'Cooper (R)' -> 'Republican'"""
+    match = re.search(r'\(([^)]+)\)', author)
+    if not match:
+        return "Other"
+    party_code = match.group(1).strip()
+    if party_code == "R":
+        return "Republican"
+    elif party_code in ("D", "DFL"):
+        return "Democrat"
+    else:
+        return "Other"
+
+def extract_is_bipartisan(author, additional_authors):
+    """Check if bill has both R and D authors"""
+    all_authors = author + ";" + additional_authors
+    has_r = bool(re.search(r'\(R\)', all_authors))
+    has_d = bool(re.search(r'\((D|DFL)\)', all_authors))
+    return has_r and has_d
+
+def clean_status(status):
+    """Simplify status to top-level outcome"""
+    status = status.strip()
+    if status.startswith("Failed"):
+        return "Failed"
+    elif status.startswith("Enacted"):
+        return "Enacted"
+    elif status.startswith("Passed"):
+        return "Passed"
+    elif status.startswith("Pending"):
+        return "Pending"
+    elif status.startswith("Adopted"):
+        return "Adopted"
+    elif status.startswith("Vetoed"):
+        return "Vetoed"
+    else:
+        return "Other"
+
+def parse_bills(soup):
+    """Extract bill data from parsed HTML"""
+    bills = []
+    
+    container = soup.find("div", id="dnn_ctr34167_StateNetDB_linkList")
+    
+    if not container:
+        print("Could not find bill container")
+        return bills
+    
+    bill_blocks = container.find_all("div", style=lambda s: s and "font-weight: bold" in s)
+    
+    print(f"Found {len(bill_blocks)} bills")
+    
+    for block in bill_blocks:
+        bill = {}
+        current_key = None
+        
+        # Grab bill link and identifier from preceding sibling div
+        prev = block.find_previous_sibling("div")
+        if prev:
+            link = prev.find("a")
+            if link:
+                identifier = link.get_text(strip=True)
+                state, bill_number, bill_id = parse_bill_identifier(identifier)
+                bill["state"] = state
+                bill["bill_number"] = bill_number
+                bill["bill_id"] = bill_id
+                bill["bill_url"] = link.get("href", "")
+                bill["session_year"] = prev.get_text(strip=True).replace(identifier, "").strip()
+
+        # Walk through siblings to get status, author, topics, summary
+        for sibling in block.next_siblings:
+            if sibling.name == "div":
+                break
+            if sibling.name == "b":
+                current_key = sibling.get_text(strip=True).replace(":", "")
+            elif current_key and isinstance(sibling, str):
+                value = sibling.strip()
+                if value:
+                    bill[current_key] = value
+
+        # Clean and derive fields
+        raw_status = bill.get("Status", "")
+        bill["status"] = clean_status(raw_status)
+        bill["status_full"] = raw_status
+
+        author = bill.get("Author", "")
+        additional = bill.get("Additional Authors", "")
+        bill["party"] = extract_party(author)
+        bill["is_bipartisan"] = extract_is_bipartisan(author, additional)
+
+        bills.append(bill)
+    
+    return bills
+
+def save_to_csv(bills, filepath):
+    """Save bills list to CSV"""
+    df = pd.DataFrame(bills)
+    cols = ["state", "bill_number", "bill_id", "session_year", "party",
+            "is_bipartisan", "status", "status_full", "Author", 
+            "Additional Authors", "Topics", "Summary", "bill_url"]
+    cols = [c for c in cols if c in df.columns]
+    df = df[cols]
+    df.to_csv(filepath, index=False)
+    print(f"Saved {len(df)} bills to {filepath}")
+
+soup = load_page("data/raw/ncsl_raw_2025.html")
+bills = parse_bills(soup)
+save_to_csv(bills, "data/processed/ncsl_2025_scraped.csv")
